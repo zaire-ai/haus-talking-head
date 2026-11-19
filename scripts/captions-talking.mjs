@@ -1,0 +1,105 @@
+// Builds an ASS karaoke caption track from the CapCut auto-caption timing, then renders it with FFmpeg
+// to a transparent ProRes 4444 overlay (captions/haus_captions.mov) for CapCut.
+// usage: node captions.mjs [seconds]   (optional seconds = render only the first N seconds as a test)
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
+import { spawnSync } from "child_process";
+
+const SKILL = "C:/Users/Zaire/.claude/skills/haus-onboarding";
+const HERE = process.cwd();                                   // captions are written to ./captions/
+const FFMPEG = process.env.FFMPEG || "ffmpeg";                // any ffmpeg with libass on PATH, or set FFMPEG=<path>
+// CapCut draft with the auto-caption text track: set DRAFT=<path to draft_content.json>
+
+const OUT = path.join(HERE, "captions");
+fs.mkdirSync(path.join(OUT, "fonts"), { recursive: true });
+for (const f of ["VisbyCF-DemiBold.otf", "VisbyCF-Medium.otf"]) fs.copyFileSync(path.join(SKILL, "fonts", f), path.join(OUT, "fonts", f));
+
+const WORDS = JSON.parse(fs.readFileSync(process.env.WORDS, "utf8"));
+const fix = (t) => t.replace(/[,.?!]+$/g, "");
+const toks = [];
+WORDS.forEach(([s, e, t], i) => {
+  let w = t.trim(); if (w === "-working" || w === "-working,") { toks[toks.length - 1].t = "co-working"; toks[toks.length - 1].b = e; return; }
+  if (w === "co") { toks.push({ a: s, b: e, t: "co", brk: false }); return; }
+  const brk = /[,.?!]$/.test(w);
+  toks.push({ a: s, b: e, t: fix(w), brk });
+});
+for (let i = 0; i < toks.length; i++) if (toks[i].t === "own" && toks[i + 1] && toks[i + 1].t === "Elevate") toks[i].t = "owned";
+const segs = [];
+let cur = [];
+const flush = () => { if (!cur.length) return; const st = cur[0].a, en = cur.at(-1).b; segs.push({ start: st, dur: en - st + 0.05, words: cur.map((x) => ({ t: x.t, a: x.a - st, b: x.b - st })) }); cur = []; };
+toks.forEach((x, i) => {
+  cur.push(x);
+  const gap = toks[i + 1] ? toks[i + 1].a - x.b : 9;
+  if ((x.brk && cur.length >= 3) || cur.length >= 7 || gap > 0.5) flush();
+});
+flush();
+segs.sort((a, b) => a.start - b.start);
+// No overlapping captions (user rule 2026-11-17: no glitches): a line ends no later than the next one starts,
+// and lines that follow within 0.35 s swap without fades, so two lines are never on screen at once.
+segs.forEach((s, i) => { const n = segs[i + 1]; s.fadeOut = true; s.fadeIn = s.fadeIn !== false;
+  if (n) { if (s.start + s.dur > n.start) s.dur = n.start - s.start; if (n.start - (s.start + s.dur) < 0.35) { s.fadeOut = false; n.fadeIn = false; } } });
+
+// brand + readability fixes to the auto transcript
+function clean(words) {
+  const out = words.map((x) => ({ ...x }));
+  out.forEach((x, i) => {
+    const l = x.t.toLowerCase(), p = i ? out[i - 1].t : "";
+    if (l === "house") x.t = "HAUS";
+    else if (p === "HAUS" && l === "platform") x.t = "Platform";
+    else if (p === "HAUS" && l === "support") x.t = "Support";
+    else if (p === "Support" && l === "team") x.t = "Team";
+  });
+  /* keep whisper casing */
+  return out;
+}
+
+const ts = (s) => { const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), x = s - h * 3600 - m * 60; return `${h}:${String(m).padStart(2, "0")}:${x.toFixed(2).padStart(5, "0")}`; };
+const PEACH = "&H00ECC2D8&", WHITE = "&H00FFFFFF&";
+const esc = (t) => t.replace(/[{}\\]/g, "").toUpperCase(); // ALL CAPS captions (user rule 2026-11-17)
+
+let events = "";
+for (const s of segs) {
+  const ws = clean(s.words), end = s.start + s.dur;
+  ws.forEach((w, i) => {
+    const a = s.start + w.a, b = i < ws.length - 1 ? s.start + ws[i + 1].a : end;
+    if (b - a < 0.02) return;
+    const line = ws.map((x, j) => (j === i ? `{\\c${PEACH}}${esc(x.t)}{\\c${WHITE}}` : esc(x.t))).join(" ");
+    const lead = i === 0 ? (s.fadeIn ? "{\\fad(160,0)\\fscx94\\fscy94\\t(0,200,\\fscx100\\fscy100)}" : "") : i === ws.length - 1 ? (s.fadeOut ? "{\\fad(0,160)}" : "") : "";
+    // for the first word also cover any leading gap from the segment start
+    const from = i === 0 ? s.start : a;
+    events += `Dialogue: 0,${ts(from)},${ts(b)},Cap,,0,0,0,,${lead}${line}\n`;
+  });
+}
+
+const ass = `[Script Info]
+ScriptType: v4.00+
+PlayResX: 1920
+PlayResY: 1080
+WrapStyle: 0
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding
+Style: Cap,Visby CF Demi Bold,60,${WHITE},${WHITE},&H00331C1C&,&H70000000&,0,0,0,0,100,100,0.5,0,1,4,2,2,380,380,90,1
+
+[Events]
+Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
+${events}`;
+fs.writeFileSync(path.join(OUT, "haus_captions.ass"), ass);
+const total = Math.ceil(segs.at(-1).start + segs.at(-1).dur + 0.6);
+console.log("segments", segs.length, "events", events.split("\n").length - 1, "length", total + "s");
+
+// FFmpeg's ass filter loses alpha on a transparent canvas, so render colour and matte passes and merge them.
+const matte = ass.replace(/&H00331C1C&,&H70000000&/, "&H00FFFFFF&,&H70FFFFFF&").replace(/\{\\c&H[0-9A-F]+&\}/g, "");
+fs.writeFileSync(path.join(OUT, "haus_captions_matte.ass"), matte);
+const test = process.argv[2] ? Number(process.argv[2]) : 0;
+const dur = test || total;
+const out = test ? "haus_captions_test.mov" : "talking_captions_full.mov";
+const src = `color=c=black:s=1920x1080:r=30:d=${dur},format=rgb24`;
+const r = spawnSync(FFMPEG, ["-v", "error", "-y", "-f", "lavfi", "-i", src, "-f", "lavfi", "-i", src,
+  "-filter_complex", "[0:v]ass=haus_captions.ass:fontsdir=fonts[rgb];[1:v]ass=haus_captions_matte.ass:fontsdir=fonts,format=gray[a];[rgb][a]alphamerge,format=yuva444p10le[v]",
+  "-map", "[v]", "-c:v", "prores_ks", "-profile:v", "4444", "-pix_fmt", "yuva444p10le", "-vendor", "apl0", out],
+  { cwd: OUT, encoding: "utf8" });
+if (r.status !== 0) { console.error(r.stderr); process.exit(1); }
+console.log("wrote", path.join(OUT, out));
